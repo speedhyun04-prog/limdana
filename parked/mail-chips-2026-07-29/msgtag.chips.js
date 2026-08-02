@@ -1,0 +1,507 @@
+/* @태그 메신저 전송 프런트 — 설계: docs/ARCHITECTURE_MESSAGING_SEND.md
+   ① AI 컴포저 선두 @태그 자동완성(계정 보유 조직원만) — 실제 라우팅·전송은 서버.
+   ② AI 초안 발송 카드 — SSE tool 이벤트의 draft 를 chat.js 가 위임하면 카드를
+      그리고, [보내기]는 사용자 본인 세션으로 기존 rooms API 를 부른다(via 표식).
+   팝아웃(방/메신저/조직도 창)에는 AI 컴포저가 없으므로 자동완성을 붙이지 않는다. */
+'use strict';
+const MsgTag = (() => {
+  const isPop = typeof POP_RID !== 'undefined' && (POP_RID || POP_MSN || POP_ORG);
+  const input = $('input');
+
+  /* ── 전송 가능 대상 (rooms + peers = 계정 보유자의 단일 출처, 60초 캐시) ──
+     draftCard(경로 ②) 폴백 전용으로 유지 — 칩 자동완성은 아래 loadRecipients. */
+  let people = [], peopleTs = 0;
+  async function loadPeople() {
+    if (Date.now() - peopleTs < 60000 && people.length) return people;
+    try {
+      const j = await (await fetch('/api/rooms')).json();
+      const seen = {}, out = [];
+      const add = p => { if (p && p.uid && !seen[p.uid]) { seen[p.uid] = 1; out.push(p); } };
+      (j.rooms || []).forEach(r => add(r.peer));
+      (j.peers || []).forEach(add);
+      people = out; peopleTs = Date.now();
+    } catch (e) {}
+    return people;
+  }
+
+  /* ── 수신자 칩 확장 (경로 ③) — 설계: docs/ARCHITECTURE.md §4.4 ──
+     조직도 전체 + 계정을 병합한 표준형(person)을 60초 캐시로 받아 온다.
+     실패해도 조용히 빈 목록(콘솔만) — 칩 기능 불능이 다른 경로를 막지 않는다. */
+  let recip = { people: [], depts: [] }, recipTs = 0;
+  async function loadRecipients() {
+    if (Date.now() - recipTs < 60000 && recip.people.length) return recip;
+    try {
+      const j = await (await fetch('/api/recipients/depts')).json();
+      if (j && j.ok) { recip = { people: j.people || [], depts: j.depts || [] }; recipTs = Date.now(); }
+    } catch (e) { console.warn('[msgtag] loadRecipients 실패', e); }
+    return recip;
+  }
+
+  /* ── 칩 상태 — 중복 방지 키는 web/recipients.py chip_key 와 동일 규칙 ── */
+  let chips = [];
+  function chipKeyOf(p) {
+    return p.uid ? 'u:' + p.uid : (p.email ? 'e:' + String(p.email).toLowerCase()
+      : 'n:' + (p.name || '') + '|' + (p.dept || ''));
+  }
+  function addChip(p) {
+    if (!p) return false;
+    const k = chipKeyOf(p);
+    if (chips.some(c => chipKeyOf(c) === k)) return false;
+    chips.push(p);
+    renderChipBar();
+    return true;
+  }
+  function removeChip(k) {
+    chips = chips.filter(c => chipKeyOf(c) !== k);
+    renderChipBar();
+    hintSync();
+  }
+  function renderChipBar() {
+    const comp = $('composer');
+    let bar = $('chipBar');
+    if (!chips.length) { if (bar) bar.remove(); return; }
+    if (!bar && comp) {
+      bar = document.createElement('div'); bar.id = 'chipBar';
+      const box = comp.querySelector('.comp-box');
+      comp.insertBefore(bar, box);
+    }
+    if (!bar) return;
+    bar.innerHTML = '';
+    chips.forEach(p => {
+      const k = chipKeyOf(p);
+      const span = document.createElement('span');
+      span.className = 'rc-chip' + (p.uid ? '' : ' mail-only');
+      if (!p.uid) span.title = '계정 없음 · 메일만 가능';
+      span.innerHTML = (p.uid ? '' : '<i class="rc-mail">✉</i>') +
+        '<b>' + esc(p.name) + '</b><small>' + esc(p.dept || '') + '</small>' +
+        '<button type="button" class="rc-x" aria-label="삭제">×</button>';
+      span.querySelector('.rc-x').onclick = () => removeChip(k);
+      bar.appendChild(span);
+    });
+  }
+
+  /* ── 한글 자모 매칭 — 필터가 1글자(조합 중 'ㅂ'·'비')부터 걸리게 (2026-07-29
+     보스 지시). 음절을 자모열로 풀어 부분일치: jamo('비비')='ㅂㅣㅂㅣ' 는
+     'ㅂ'·'비'·'빕'(조합 중간) 전부에 걸린다. 자음만 연속(ㅂㅂ)은 초성열로
+     따로 대조(카톡식 초성 검색). ── */
+  const CHO = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
+  const JUNG = 'ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ';
+  const JONG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ',
+    'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
+  function jamo(s) {
+    let o = '';
+    for (const ch of String(s || '')) {
+      const c = ch.charCodeAt(0);
+      if (c >= 0xAC00 && c <= 0xD7A3) {
+        const i = c - 0xAC00;
+        o += CHO[Math.floor(i / 588)] + JUNG[Math.floor((i % 588) / 28)] + JONG[i % 28];
+      } else o += ch;
+    }
+    return o.toLowerCase();
+  }
+  function chos(s) {
+    let o = '';
+    for (const ch of String(s || '')) {
+      const c = ch.charCodeAt(0);
+      o += (c >= 0xAC00 && c <= 0xD7A3) ? CHO[Math.floor((c - 0xAC00) / 588)] : ch;
+    }
+    return o;
+  }
+  function nameHit(p, q) {
+    if (!q) return true;
+    const hay = (p.name || '') + ' ' + (p.dept || '');
+    if (/^[ㄱ-ㅎ]+$/.test(q)) return chos(hay).includes(q);   // 초성만 입력
+    return jamo(hay).includes(jamo(q));
+  }
+
+  /* ── 자동완성 드롭다운 (§5 z-index 사다리: 85 층 — plusMenu 와 같은 급)
+     데이터 소스는 조직도 전체 + 계정(loadRecipients) — 계정 미보유자는 ✉ 표시.
+     pick() 은 텍스트 삽입 대신 칩 추가 + @토큰 텍스트 삭제(경로 ③). ── */
+  let pop = null, items = [], act = 0, tokStart = 0;
+  function popClose() { if (pop) { pop.remove(); pop = null; } }
+  function tokenAt() {
+    // 선두 멘션 구역에서만 반응: (@이름 공백)* @부분입력 ← 캐럿
+    const head = input.value.slice(0, input.selectionStart);
+    const m = head.match(/^(?:@\S+\s+)*@([^\s@]*)$/);
+    return m ? { q: m[1] } : null;
+  }
+  function pick(i) {
+    const p = items[i]; if (!p) return;
+    const pos = input.selectionStart, v = input.value;
+    input.value = v.slice(0, tokStart) + v.slice(pos);   // @토큰 텍스트만 삭제
+    input.setSelectionRange(tokStart, tokStart);
+    popClose();
+    addChip(p);
+    hintSync();
+    input.dispatchEvent(new Event('input'));   // chat.js 높이 재계산
+    input.focus();
+  }
+  function render() {
+    if (!pop) {
+      pop = document.createElement('div'); pop.id = 'tagPop';
+      $('composer').appendChild(pop);
+    }
+    pop.innerHTML = '<div class="tag-head"><i class="ico ico-send"></i> 수신자로 추가</div>';
+    items.forEach((p, i) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'tag-it' + (i === act ? ' is-act' : '');
+      b.innerHTML = (p.uid ? '' : '<i class="rc-mail">✉</i>') +
+        '<b>' + esc(p.name) + '</b><small>' + esc(p.dept || '') + '</small>';
+      b.onmousedown = ev => { ev.preventDefault(); pick(i); };  // blur 전에 처리
+      pop.appendChild(b);
+    });
+  }
+
+  /* ── @@ 부서 드롭다운 — 부서 선택 시 부서원 전원을 개별 칩으로 펼친다 ── */
+  let deptPop = null, deptItems = [], deptAct = 0, deptTokStart = 0;
+  function deptPopClose() { if (deptPop) { deptPop.remove(); deptPop = null; } }
+  function deptTokenAt() {
+    const head = input.value.slice(0, input.selectionStart);
+    const m = head.match(/(?:^|\s)@@([^\s@]*)$/);
+    return m ? { q: m[1] } : null;
+  }
+  function deptHit(d, q) {
+    if (!q) return true;
+    if (/^[ㄱ-ㅎ]+$/.test(q)) return chos(d.name).includes(q);
+    return jamo(d.name).includes(jamo(q));
+  }
+  function deptRender() {
+    if (!deptPop) {
+      deptPop = document.createElement('div'); deptPop.id = 'deptPop';
+      $('composer').appendChild(deptPop);
+    }
+    deptPop.innerHTML = '<div class="tag-head"><i class="ico ico-people"></i> 부서 전체 추가</div>';
+    deptItems.forEach((d, i) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'tag-it' + (i === deptAct ? ' is-act' : '');
+      b.innerHTML = '<b>' + esc(d.name) + '</b><small>' + d.count + '명</small>';
+      b.onmousedown = ev => { ev.preventDefault(); deptPick(i); };
+      deptPop.appendChild(b);
+    });
+  }
+  function deptPick(i) {
+    const d = deptItems[i]; if (!d) return;
+    const pos = input.selectionStart, v = input.value;
+    input.value = v.slice(0, deptTokStart) + v.slice(pos);   // @@토큰 텍스트만 삭제
+    input.setSelectionRange(deptTokStart, deptTokStart);
+    deptPopClose();
+    let added = 0;
+    (d.members || []).forEach(p => { if (addChip(p)) added++; });
+    hintSync();
+    input.dispatchEvent(new Event('input'));
+    input.focus();
+    if (typeof toastShow === 'function')
+      toastShow('아호비', d.name + ' ' + added + '명 추가', null);
+  }
+  async function deptSync(dt) {
+    const rec = await loadRecipients();
+    const dtt = deptTokenAt();                // await 사이 입력 변화 재확인
+    if (!dtt) { deptPopClose(); return; }
+    deptTokStart = input.selectionStart - dtt.q.length - 2;
+    const q = dtt.q;
+    deptItems = (rec.depts || []).filter(d => deptHit(d, q)).slice(0, 10);
+    deptAct = 0;
+    if (!deptItems.length) { deptPopClose(); return; }
+    deptRender();
+  }
+
+  async function sync() {
+    const dt = deptTokenAt();
+    if (dt) { popClose(); await deptSync(dt); return; }
+    deptPopClose();
+    const t = tokenAt();
+    if (!t) { popClose(); hintSync(); return; }
+    const rec = await loadRecipients();
+    const all = rec.people;
+    const tt = tokenAt();                     // await 사이 입력 변화 재확인
+    if (!tt) { popClose(); return; }
+    tokStart = input.selectionStart - tt.q.length - 1;
+    const q = tt.q;
+    items = all.filter(p => nameHit(p, q)).slice(0, 8);
+    act = 0;
+    if (!items.length) { popClose(); return; }
+    render();
+  }
+  /* ── 선두 @태그 파란 강조 (2026-07-29 보스 지시) — textarea 는 부분 스타일이
+     안 되므로 같은 금속(폰트·위치)의 미러(#tagMirror)를 밑에 깔고, 태그가 있을
+     때만 textarea 글자를 투명하게 한다(캐럿은 caret-color 로 유지). 굵기는
+     -webkit-text-stroke 가짜 볼드 — 진짜 bold 는 글리프 폭이 변해 미러와
+     캐럿이 어긋난다. 위치 계산은 rAF — chat.js 높이 재계산 이후에 잰다. ── */
+  let mirror = null;
+  function mirrorSync() {
+    if (!input) return;
+    const v = input.value;
+    const on = /^@\S/.test(v);
+    input.classList.toggle('has-tags', on);
+    if (!on) { if (mirror) { mirror.remove(); mirror = null; } return; }
+    if (!mirror) {
+      mirror = document.createElement('div');
+      mirror.id = 'tagMirror';
+      input.parentElement.appendChild(mirror);   // .comp-box (position:relative)
+    }
+    // 선두 멘션 구역만 색칠: (@이름 공백)* + 아직 조합 중인 @부분입력, 이후는 평문
+    let rest = v, html = '';
+    for (;;) {
+      const m = rest.match(/^(@\S+)(\s+)/);
+      if (!m) break;
+      html += '<b class="mt">' + esc(m[1]) + '</b>' + esc(m[2]);
+      rest = rest.slice(m[0].length);
+    }
+    if (/^@[^\s@]*$/.test(rest)) { html += '<b class="mt">' + esc(rest) + '</b>'; rest = ''; }
+    mirror.innerHTML = html + esc(rest);
+    requestAnimationFrame(() => {
+      if (!mirror) return;
+      const cs = getComputedStyle(input);
+      mirror.style.font = cs.font;
+      mirror.style.lineHeight = cs.lineHeight;
+      mirror.style.letterSpacing = cs.letterSpacing;
+      mirror.style.left = input.offsetLeft + 'px';
+      mirror.style.top = input.offsetTop + 'px';
+      mirror.style.width = input.clientWidth + 'px';
+      mirror.style.height = input.clientHeight + 'px';
+      mirror.scrollTop = input.scrollTop;
+    });
+  }
+
+  function hintSync() {
+    // 칩이 있으면 발송 카드 안내가 우선, 없으면 선두 @태그 형식일 때
+    // '엔터 = 메신저 전송' 안내 (AI 질문과 착각 방지)
+    let h = $('tagHint');
+    const hasChip = chips.length > 0;
+    const hasLead = /^@\S+(\s|$)/.test(input ? input.value : '');
+    const on = hasChip || hasLead;
+    if (on && !h) {
+      h = document.createElement('div'); h.id = 'tagHint';
+      $('composer').appendChild(h);
+    }
+    if (h) {
+      h.innerHTML = hasChip
+        ? '<i class="ico ico-send"></i> 칩 수신자에게 보내기 — 엔터를 누르면 발송 카드가 열립니다'
+        : '<i class="ico ico-send"></i> @태그 메시지 — 엔터를 누르면 메신저로 바로 전송됩니다';
+    }
+    if (!on && h) h.remove();
+    if (h && (pop || deptPop)) h.remove();    // 드롭다운과 겹치면 드롭다운 우선
+  }
+
+  if (input && !isPop) {
+    input.addEventListener('input', () => { sync(); mirrorSync(); });
+    input.addEventListener('click', sync);
+    // keyup: 엔터 전송처럼 input 이벤트 없이 값이 비워지는 경로의 미러 청소
+    input.addEventListener('keyup', mirrorSync);
+    input.addEventListener('scroll', mirrorSync);
+    addEventListener('resize', mirrorSync);
+    input.addEventListener('blur', () => setTimeout(() => { popClose(); deptPopClose(); }, 150));
+    // 드롭다운 열림 중 키 탐색 — chat.js 의 Enter=send 보다 먼저(문서 캡처 단계)
+    // pop(이름)·deptPop(부서) 중 열린 쪽이 우선(둘이 동시에 열리지 않게 sync()/deptSync()가 서로 닫는다).
+    document.addEventListener('keydown', e => {
+      if (pop) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          act = (act + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length;
+          render();
+        } else if (e.key === 'Enter' || e.key === 'Tab') pick(act);
+        else if (e.key === 'Escape') popClose();
+        else return;
+        e.preventDefault(); e.stopPropagation();
+        return;
+      }
+      if (deptPop) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          deptAct = (deptAct + (e.key === 'ArrowDown' ? 1 : deptItems.length - 1)) % deptItems.length;
+          deptRender();
+        } else if (e.key === 'Enter' || e.key === 'Tab') deptPick(deptAct);
+        else if (e.key === 'Escape') deptPopClose();
+        else return;
+        e.preventDefault(); e.stopPropagation();
+      }
+    }, true);
+  }
+
+  /* ── AI 초안 발송 카드 (경로 ② — 전송 버튼은 언제나 사람) ── */
+  function draftCard(draft) {
+    const chat = $('chat'); if (!chat || !draft) return;
+    const d = document.createElement('div');
+    d.className = 'msg ai';
+    d.innerHTML =
+      '<div class="who"><b>9._.o</b><span>아호비</span></div>' +
+      '<div class="draft-card"><div class="dc-head"><i class="ico ico-send"></i> 메신저 초안 · <b></b></div>' +
+      '<div class="dc-body"></div><div class="dc-row">' +
+      '<button class="dc-send" type="button">보내기</button>' +
+      '<button class="dc-cancel" type="button">취소</button>' +
+      '<span class="dc-state"></span></div></div>';
+    d.querySelector('.dc-head b').textContent = (draft.name || '(이름 없음)') + ' 님에게';
+    d.querySelector('.dc-body').textContent = draft.text || '';
+    const state = d.querySelector('.dc-state');
+    const btns = d.querySelectorAll('.dc-send,.dc-cancel');
+    d.querySelector('.dc-cancel').onclick = () => {
+      btns.forEach(b => b.remove()); state.textContent = '취소했어요';
+    };
+    d.querySelector('.dc-send').onclick = async () => {
+      btns.forEach(b => b.disabled = true); state.textContent = '전송 중…';
+      try {
+        // 발송 키 우선순위: uid → email → 이름으로 대상 조회(구서버가 draft 에
+        // uid 를 안 실어주는 동안의 폴백 — 닉네임 계정은 이메일이 없다).
+        let key = null;
+        if (draft.uid) key = { uid: draft.uid };
+        else if (draft.email) key = { email: draft.email };
+        else {
+          const all = await loadPeople();
+          const hits = all.filter(p => p.name === (draft.name || '').trim());
+          if (hits.length === 1) key = { uid: hits[0].uid };
+          else throw new Error(hits.length ? '동명이인이 있어 특정할 수 없습니다'
+                                           : '대상 계정을 찾지 못했습니다');
+        }
+        const o = await (await fetch('/api/rooms', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(key) })).json();
+        if (!o.ok) throw new Error(o.error || '대화방을 열 수 없습니다');
+        const s = await (await fetch('/api/rooms/' + encodeURIComponent(o.id) + '/send', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: draft.text || '', via: 'ahovye' }) })).json();
+        if (!s.ok) throw new Error(s.error || '전송 실패');
+        btns.forEach(b => b.remove()); state.textContent = '전송 완료 ✓';
+        if (typeof toastShow === 'function')
+          toastShow('아호비', (draft.name || '상대') + '님에게 전송했어요.', null);
+      } catch (e) {
+        btns.forEach(b => b.disabled = false);
+        state.textContent = '실패: ' + (e && e.message ? e.message : e);
+      }
+    };
+    chat.appendChild(d);
+    if (typeof scrollBottom === 'function') scrollBottom(true);
+  }
+
+  /* ── 칩 유무 (chat.js send() 분기용) ── */
+  function hasChips() { return chips.length > 0; }
+
+  /* ── 발송 카드 (경로 ③ — 칩 수신자, 메신저 다중 전송 / 메일 발송) ──
+     draft-card 문법 재사용. 전송 fetch 는 아래 버튼 onclick 안에만 존재한다
+     (AI/서버 자동 발송 금지, PLAYBOOK 1-11). */
+  function openSendCard(body) {
+    const chat = $('chat'); if (!chat) return;
+    const bodyText = body || '';
+    const cardChips = chips.slice();               // 카드 열 시점 스냅샷
+    const msgTargets = cardChips.filter(p => p.uid);
+    const mailTargets = cardChips.filter(p => p.email);
+    const noAcctNames = cardChips.filter(p => !p.uid).map(p => p.name);
+    const noMailNames = cardChips.filter(p => !p.email).map(p => p.name);
+
+    const d = document.createElement('div');
+    d.className = 'msg ai';
+    d.innerHTML =
+      '<div class="who"><b>9._.o</b><span>아호비</span></div>' +
+      '<div class="draft-card send-card">' +
+      '<div class="dc-head"><i class="ico ico-send"></i> 수신자 ' + cardChips.length + '명에게 보내기</div>' +
+      '<div class="sc-summary"></div>' +
+      '<div class="sc-exclude"></div>' +
+      '<input type="text" class="sc-subject" placeholder="제목">' +
+      '<div class="dc-body"></div>' +
+      '<div class="dc-row">' +
+      '<button class="dc-send sc-msg" type="button">메신저로 보내기</button>' +
+      '<button class="dc-send sc-mail" type="button">메일로 보내기</button>' +
+      '<button class="dc-cancel" type="button">취소</button>' +
+      '<span class="dc-state"></span></div></div>';
+
+    d.querySelector('.sc-summary').textContent =
+      '메신저 가능 ' + msgTargets.length + '명 · 메일만 가능 ' + (cardChips.length - msgTargets.length) + '명';
+    const exNode = d.querySelector('.sc-exclude');
+    const exParts = [];
+    if (noAcctNames.length) exParts.push('메신저에서 제외: ' + noAcctNames.join(', '));
+    if (noMailNames.length) exParts.push('메일에서 제외: ' + noMailNames.join(', '));
+    if (!msgTargets.length) exParts.push('메신저 계정 보유자가 없습니다');
+    if (!mailTargets.length) exParts.push('메일 주소 보유자가 없습니다');
+    if (exParts.length) exNode.textContent = exParts.join(' · '); else exNode.remove();
+    const subjInput = d.querySelector('.sc-subject');
+    subjInput.value = '[아호비] ' + bodyText.slice(0, 24);
+    d.querySelector('.dc-body').textContent = bodyText;
+
+    const state = d.querySelector('.dc-state');
+    const btnMsg = d.querySelector('.sc-msg');
+    const btnMail = d.querySelector('.sc-mail');
+    const btnCancel = d.querySelector('.dc-cancel');
+    const allBtns = [btnMsg, btnMail, btnCancel];
+    if (!msgTargets.length) btnMsg.disabled = true;
+    if (!mailTargets.length) btnMail.disabled = true;
+
+    const clearChipsAfterSuccess = () => {
+      chips = []; renderChipBar(); hintSync();
+    };
+
+    btnCancel.onclick = () => {
+      allBtns.forEach(b => b.remove()); state.textContent = '취소했어요';
+    };
+
+    btnMsg.onclick = async () => {
+      if (btnMsg.disabled) return;
+      allBtns.forEach(b => b.disabled = true); state.textContent = '전송 중…';
+      try {
+        const o = await (await fetch('/api/rooms/sendmany', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targets: msgTargets.map(p => p.uid), text: bodyText })
+        })).json();
+        if (!o.ok) throw new Error(o.error || '전송 실패');
+        const fails = (o.results || []).filter(r => !r.ok);
+        const sent = o.sent || 0;
+        let msg = '전송 완료 ' + sent + '명';
+        if (fails.length) msg += '\n' + fails.map(r => '⚠ ' + r.name + ': ' + (r.error || '실패')).join('\n');
+        state.textContent = msg;
+        // 개별 결과가 전원 실패(sent===0)면 성공으로 취급하지 않는다 — 칩을 비우지
+        // 않고 버튼도 재활성화해 재시도할 수 있게 한다(§4.4, 검증 발견 버그 픽스).
+        if (sent > 0) {
+          allBtns.forEach(b => b.remove());
+          clearChipsAfterSuccess();
+          if (typeof toastShow === 'function')
+            toastShow('아호비', '메신저 전송 완료 ' + sent + '명', null);
+        } else {
+          allBtns.forEach(b => b.disabled = false);
+          if (!msgTargets.length) btnMsg.disabled = true;
+          if (!mailTargets.length) btnMail.disabled = true;
+        }
+      } catch (e) {
+        allBtns.forEach(b => b.disabled = false);
+        if (!msgTargets.length) btnMsg.disabled = true;
+        if (!mailTargets.length) btnMail.disabled = true;
+        state.textContent = '실패: ' + (e && e.message ? e.message : e);
+      }
+    };
+
+    btnMail.onclick = async () => {
+      if (btnMail.disabled) return;
+      allBtns.forEach(b => b.disabled = true); state.textContent = '전송 중…';
+      try {
+        const to = mailTargets.map(p => ({ name: p.name, email: p.email }));
+        const o = await (await fetch('/api/mail/send', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to, subject: subjInput.value, body: bodyText })
+        })).json();
+        if (!o.ok) throw new Error(o.error || '메일 발송 실패');
+        allBtns.forEach(b => b.remove());
+        clearChipsAfterSuccess();
+        if (o.mode === 'smtp') {
+          state.textContent = '메일 발송 완료 ' + ((o.sent && o.sent.length) || to.length) + '명 (SMTP)';
+        } else {
+          state.textContent = '메일 앱에 초안을 열었어요 (SMTP 미설정 폴백)';
+          if (o.mailto) location.href = o.mailto;
+        }
+      } catch (e) {
+        allBtns.forEach(b => b.disabled = false);
+        if (!msgTargets.length) btnMsg.disabled = true;
+        if (!mailTargets.length) btnMail.disabled = true;
+        state.textContent = '실패: ' + (e && e.message ? e.message : e);
+      }
+    };
+
+    chat.appendChild(d);
+    if (typeof scrollBottom === 'function') scrollBottom(true);
+
+    // 메일 버튼 라벨 — SMTP 미설정이면 폴백임을 미리 안내(읽기 전용 GET, 발송 아님)
+    (async () => {
+      try {
+        const s = await (await fetch('/api/mail/status')).json();
+        if (s && s.ok && !s.smtp && btnMail.isConnected)
+          btnMail.textContent = '메일 앱으로 보내기(SMTP 미설정)';
+      } catch (e) {}
+    })();
+  }
+
+  return { draftCard, hasChips, openSendCard };
+})();
