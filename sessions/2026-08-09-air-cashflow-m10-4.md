@@ -1,12 +1,15 @@
-# 2026-08-09 air-cashflow M10-4 (웹 프런트) + db_conn 크로스 스레드 수정
+# 2026-08-09 air-cashflow 4단계 완결 (M10-4 프런트 · db_conn 수정 · M10-5 테스트 · M10-6 문서)
 
 ## 어디까지 했나
 
-**M10-4 완료, 커밋까지 끝. 다음은 M10-5 (테스트 W1~W14).**
+**4단계 전부 완료 (M10-0 ~ M10-6). 다음은 5단계(편집 UI), 미착수.**
+인수인계는 `docs/HANDOFF_WEB.md` 하나로 충분하다.
 
-커밋 2개 (푸시 안 함, 로컬):
-- `51263e8` feat(web): M10-4 프런트 9파일 + webctl/jscheck + 연결 주입 방식 교정 (아키텍트가 합쳐서 커밋)
+커밋 4개 (푸시 안 함, 로컬):
+- `51263e8` feat(web): M10-4 프런트 9파일 + webctl/jscheck + 연결 주입 방식 교정
 - `2a0944f` fix(web): 폴링 경합 수정 + run 소요 시간 정정
+- `f5bb13e` test(web): M10-5 W1~W14, 인수 조건 W-ACC 파일 바이트 동치 통과
+- `6e9ec74` docs(web): M10-6 완료 기록 + HANDOFF_WEB.md + README
 
 작업 트리 깨끗함. 미커밋 WIP 없음.
 
@@ -55,9 +58,21 @@ dataset `base` 1개, scenario 16개, run 4개(#1·#2·#4 base/base, #3 v1_gecas_
    UI 결함으로 오해하기 쉽다. 왕복 검증은 `dispatchEvent(new MouseEvent('click',...))` 로 했다.
    스크린샷도 "Browser pane is not displayed" 로 실패한다.
 
+## M10-5·M10-6 에서 더 확정된 것
+
+5. **시간 예산 미결은 "테스트가 시간을 판정하지 않는다"로 정리했다** (§19.16-1).
+   `pytest tests -q` = **129 통과 + 7 skip, 94~97초** (base 69 유지, 웹 60 추가).
+   build 는 기본 2회, `AIRCF_WEB_FULL=1` 이면 3회(골든 경로 대조).
+   "이미 실행 중이면 409"는 시간에 기대지 않고 **엔진을 `threading.Event` 로 막아** 판정한다.
+6. **텍스트·패턴 가드는 대상 언어의 문법을 알아야 한다** (세 번 밟았다):
+   `golden` 부분문자열 → `verified_by_golden` 을 잡음 / "외부 URL 0건" → SVG 네임스페이스
+   URI 를 잡음 / "top-level 실행문 0" → `async function` 을 잡음.
+   처방은 매번 같다: 예외 목록을 붙이지 말고 검사를 문법 수준으로 올리거나 표현을 없앤다.
+7. **`shutil.rmtree(ignore_errors=True)` 가 청소 실패를 삼킨다.** 테스트가 만든 임시 폴더가
+   실행마다 %TEMP% 에 쌓였다. `tests/web_util.py:rmtree_hard()` 로 재시도 + 경고.
+
 ## 다음 세션 첫 할 일
 
-M10-5 (테스트 4파일: `tests/web_util.py`, `test_web_api.py`, `test_web_run.py`,
-`test_web_guards.py`, W1~W14). 착수 전 결정 1건이 남아 있다: 위 2번 때문에
-§11.3 의 시간 예산(20초 이내)을 어떻게 다룰지. `tmp_path` 금지(이 PC 에서 PermissionError),
-`tests/conftest.py` 무수정이 전제다.
+5단계(편집 UI)다. `docs/HANDOFF_WEB.md` §6 을 먼저 읽어라. 오더가 오면 착수 전에
+`GUARDRAILS.md` §5(오더 유형별 체크리스트)와 §7(이 앱에 없는 것)을 대조하고,
+계약·스키마 변경이 필요하면 아키텍트 선행이다.
