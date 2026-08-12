@@ -55,6 +55,14 @@
 - 프로젝트 전용 교훈은 `docs\ARCHITECTURE_EXCLUDE.md` §12.5~§12.10 과
   `docs\HANDOFF_EXCLUDE.md` §5 에 있다.
 
+## 다음 세션 첫 작업 (보스 확정)
+
+**`골든 검증됨` 배지 정정.** 제외본(`base_exclude_1961 / base`) 결과 헤더에 그 배지가
+찍히는 것을 실측했다. 판정은 scenario 스위치만 보는데 제외본은 골든이 아예 없다.
+프런트 두 파일(`view_result.js:80`, `view_run.js:86·91·132`)만 고치면 되고 서버는
+안 건드린다. 상세와 완료 판정은 **`docs\HANDOFF_EXCLUDE.md` §5.5** 에 적어 뒀다.
+같이 볼 것: 짤림 감사 최악 조합에 **실패한 run 의 오류 배지**가 빠져 있다(같은 헤더다).
+
 ## 다음 세션에서 필요한 맥락
 
 - 이어받기는 **`docs\HANDOFF_EXCLUDE.md` 하나만** 읽으면 된다. 그 다음이 설계
